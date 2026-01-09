@@ -21,6 +21,10 @@ ifdef MOZ_DEBUG
 DEFINES += -DMOZ_DEBUG=1
 endif
 
+ifdef MOZ_DEBUG_SYMBOLS
+DEFINES += -DMOZ_DEBUG_SYMBOLS=1
+endif
+
 ifneq (,$(filter gtk%,$(MOZ_WIDGET_TOOLKIT)))
 DEFINES += -DMOZ_GTK=1
 ifeq ($(MOZ_WIDGET_TOOLKIT),gtk3)

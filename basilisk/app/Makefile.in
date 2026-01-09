@@ -44,6 +44,13 @@ endif
 
 GARBAGE += $(addprefix $(FINAL_TARGET)/defaults/pref/, basilisk.js)
 
+else
+# Copy PDB files for Windows debug builds
+ifdef MOZ_DEBUG_SYMBOLS
+libs::
+	$(INSTALL) $(IFLAGS1) $(PROGRAM:.exe=.pdb) $(DIST)/bin
+endif
+
 endif
 
 # channel-prefs.js is handled separate from other prefs due to bug 756325

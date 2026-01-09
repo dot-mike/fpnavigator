@@ -136,6 +136,9 @@
 #endif
 #ifndef XP_UNIX
 @BINPATH@/@MOZ_APP_NAME@.exe
+#ifdef MOZ_DEBUG_SYMBOLS
+@BINPATH@/@MOZ_APP_NAME@.pdb
+#endif
 @BINPATH@/@MOZ_APP_NAME@.VisualElementsManifest.xml
 @BINPATH@/browser/VisualElements/VisualElements_150.png
 @BINPATH@/browser/VisualElements/VisualElements_70.png
