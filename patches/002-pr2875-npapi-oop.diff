@@ -1,0 +1,526 @@
+From b4743e3a3adca59d648fda4086cde00f7222d5c3 Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Sat, 6 Dec 2025 14:58:39 +0800
+Subject: [PATCH 1/8] Issue #2861 - Part 1: Allow nsNPAPIPlugin::RunPluginOOP
+ to be made false.
+
+This effectively reverts Part A of Mozilla bug 1194780.
+---
+ dom/plugins/base/nsNPAPIPlugin.cpp | 128 +++++++++++++++++++++++++++++
+ 1 file changed, 128 insertions(+)
+
+diff --git a/dom/plugins/base/nsNPAPIPlugin.cpp b/dom/plugins/base/nsNPAPIPlugin.cpp
+index df9f014e67..572ce5f060 100644
+--- a/dom/plugins/base/nsNPAPIPlugin.cpp
++++ b/dom/plugins/base/nsNPAPIPlugin.cpp
+@@ -228,7 +228,135 @@ nsNPAPIPlugin::PluginCrashed(const nsAString& pluginDumpID,
+ bool
+ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+ {
++  if (XRE_IsContentProcess()) {
++    return true;
++  }
++
++#if (MOZ_WIDGET_GTK == 3)
++  // We force OOP on Linux/GTK3 because some plugins use GTK2 and both GTK
++  // libraries can't be loaded in the same process.
+   return true;
++#else
++  if (PR_GetEnv("MOZ_DISABLE_OOP_PLUGINS")) {
++    return false;
++  }
++
++  if (!aPluginTag) {
++    return false;
++  }
++
++#ifdef ACCESSIBILITY
++  // Certain assistive technologies don't want oop Flash, thus we have a special
++  // pref for them to disable oop Flash (refer to bug 785047 for details).
++  bool useA11yPref = false;
++#ifdef XP_WIN
++  useA11yPref =  a11y::Compatibility::IsJAWS();
++#endif
++#endif
++
++#ifdef XP_WIN
++  // On Windows 7+, we force Flash to run in OOPP mode because Adobe
++  // doesn't test Flash in-process and there are known stability bugs.
++  if (aPluginTag->mIsFlashPlugin && IsWin7SP1OrLater()) {
++#ifdef ACCESSIBILITY
++    if (!useA11yPref)
++      return true;
++#else
++    return true;
++#endif
++  }
++#endif
++
++  nsIPrefBranch* prefs = Preferences::GetRootBranch();
++  if (!prefs) {
++    return false;
++  }
++
++  // Get per-library whitelist/blacklist pref string
++  // "dom.ipc.plugins.enabled.filename.dll" and fall back to the default value
++  // of "dom.ipc.plugins.enabled"
++  // The "filename.dll" part can contain shell wildcard pattern
++
++  nsAutoCString prefFile(aPluginTag->mFullPath.get());
++  int32_t slashPos = prefFile.RFindCharInSet("/\\");
++  if (kNotFound == slashPos)
++    return false;
++  prefFile.Cut(0, slashPos + 1);
++  ToLowerCase(prefFile);
++
++#ifdef XP_MACOSX
++#if defined(__i386__)
++  nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.i386.");
++#elif defined(__x86_64__)
++  nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.x86_64.");
++#elif defined(__ppc__)
++  nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.ppc.");
++#endif
++#else
++  nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.");
++#endif
++
++#ifdef ACCESSIBILITY
++  if (useA11yPref)
++    prefGroupKey.AssignLiteral("dom.ipc.plugins.enabled.a11y.");
++#endif
++
++  uint32_t prefCount;
++  char** prefNames;
++  nsresult rv = prefs->GetChildList(prefGroupKey.get(),
++                                    &prefCount, &prefNames);
++
++  bool oopPluginsEnabled = false;
++  bool prefSet = false;
++
++  if (NS_SUCCEEDED(rv) && prefCount > 0) {
++    uint32_t prefixLength = prefGroupKey.Length();
++    for (uint32_t currentPref = 0; currentPref < prefCount; currentPref++) {
++      // Get the mask
++      const char* maskStart = prefNames[currentPref] + prefixLength;
++      bool match = false;
++
++      int valid = NS_WildCardValid(maskStart);
++      if (valid == INVALID_SXP) {
++         continue;
++      }
++      else if(valid == NON_SXP) {
++        // mask is not a shell pattern, compare it as normal string
++        match = (strcmp(prefFile.get(), maskStart) == 0);
++      }
++      else {
++        match = (NS_WildCardMatch(prefFile.get(), maskStart, 0) == MATCH);
++      }
++
++      if (match && NS_SUCCEEDED(Preferences::GetBool(prefNames[currentPref],
++                                                     &oopPluginsEnabled))) {
++        prefSet = true;
++        break;
++      }
++    }
++    NS_FREE_XPCOM_ALLOCATED_POINTER_ARRAY(prefCount, prefNames);
++  }
++
++  if (!prefSet) {
++    oopPluginsEnabled =
++#ifdef XP_MACOSX
++#if defined(__i386__)
++    Preferences::GetBool("dom.ipc.plugins.enabled.i386", false);
++#elif defined(__x86_64__)
++    Preferences::GetBool("dom.ipc.plugins.enabled.x86_64", false);
++#elif defined(__ppc__)
++    Preferences::GetBool("dom.ipc.plugins.enabled.ppc", false);
++#endif
++#else
++#ifdef ACCESSIBILITY
++    useA11yPref ? Preferences::GetBool("dom.ipc.plugins.enabled.a11y", false) :
++#endif
++    Preferences::GetBool("dom.ipc.plugins.enabled", false);
++#endif
++  }
++
++  return oopPluginsEnabled;
++#endif
+ }
+ 
+ inline PluginLibrary*
+-- 
+2.43.7
+
+
+From eda712503e4cda845db7df553c56b7441db48c2f Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Sat, 6 Dec 2025 15:01:28 +0800
+Subject: [PATCH 2/8] Issue #2861 - Part 2: Restore nsIPluginHost.isPluginOOP.
+
+This effectively reverts Part B of Mozilla bug 1194780.
+---
+ dom/plugins/base/nsIPluginHost.idl |  7 ++++++-
+ dom/plugins/base/nsPluginHost.cpp  | 14 ++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/dom/plugins/base/nsIPluginHost.idl b/dom/plugins/base/nsIPluginHost.idl
+index d1124aa259..1f8bd2854d 100644
+--- a/dom/plugins/base/nsIPluginHost.idl
++++ b/dom/plugins/base/nsIPluginHost.idl
+@@ -21,7 +21,7 @@ interface nsIClearSiteDataCallback : nsISupports
+     void callback(in nsresult rv);
+ };
+ 
+-[scriptable, uuid(f938f5ba-7093-42cd-a559-af8039d99204)]
++[scriptable, uuid(405b3e43-d56f-4071-80de-ab6ad05e304d)]
+ interface nsIPluginHost : nsISupports
+ {
+   /**
+@@ -169,4 +169,9 @@ interface nsIPluginHost : nsISupports
+    * passed in the FakePluginTagInit when registering.
+    */
+   void unregisterFakePlugin(in AUTF8String handlerURI);
++
++  /**
++   * Returns true if plugins with the given mimetype will run out of process.
++   */
++  boolean isPluginOOP(in AUTF8String aMimeType);
+ };
+diff --git a/dom/plugins/base/nsPluginHost.cpp b/dom/plugins/base/nsPluginHost.cpp
+index 41616b7927..49a52b4f7b 100644
+--- a/dom/plugins/base/nsPluginHost.cpp
++++ b/dom/plugins/base/nsPluginHost.cpp
+@@ -1084,6 +1084,14 @@ nsPluginHost::GetBlocklistStateForType(const nsACString &aMimeType,
+   return tag->GetBlocklistState(aState);
+ }
+ 
++ NS_IMETHODIMP
++nsPluginHost::IsPluginOOP(const nsACString& aMimeType,
++                          bool* aResult)
++{
++  *aResult = true;
++  return NS_OK;
++}
++
+ NS_IMETHODIMP
+ nsPluginHost::GetPermissionStringForType(const nsACString &aMimeType,
+                                          uint32_t aExcludeFlags,
+@@ -2662,6 +2670,12 @@ nsPluginHost::FindPluginsForContent(uint32_t aPluginEpoch,
+     /// to be more sane and avoid this dance
+     nsPluginTag *tag = static_cast<nsPluginTag *>(basetag.get());
+ 
++    if (!nsNPAPIPlugin::RunPluginOOP(tag)) {
++      // Don't expose non-OOP plugins to content processes since we have no way
++      // to bridge them over.
++      continue;
++    }
++
+     aPlugins->AppendElement(PluginTag(tag->mId,
+                                       tag->Name(),
+                                       tag->Description(),
+-- 
+2.43.7
+
+
+From 1100ea5ebaec7eaf349af2401a213cc43889c870 Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Sat, 6 Dec 2025 16:53:38 +0800
+Subject: [PATCH 3/8] Issue #2861 - Remove checks that forcibly enable or
+ disable OOP.
+
+The pref should not be conditional on which plugin or GTK version is in use. If
+Windows users want Flash in-process, or GTK3 users want in-process plugins, we
+should let them. If it breaks, they at least have half a browser.
+
+While at it the checks for accessibility hardware support have also been taken
+out, because they're only relevant for Flash anyway. Being able to disable OOP
+should not depend on whether you use a11y.
+---
+ dom/plugins/base/nsNPAPIPlugin.cpp | 36 ------------------------------
+ 1 file changed, 36 deletions(-)
+
+diff --git a/dom/plugins/base/nsNPAPIPlugin.cpp b/dom/plugins/base/nsNPAPIPlugin.cpp
+index 572ce5f060..ad3c605b61 100644
+--- a/dom/plugins/base/nsNPAPIPlugin.cpp
++++ b/dom/plugins/base/nsNPAPIPlugin.cpp
+@@ -232,11 +232,6 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+     return true;
+   }
+ 
+-#if (MOZ_WIDGET_GTK == 3)
+-  // We force OOP on Linux/GTK3 because some plugins use GTK2 and both GTK
+-  // libraries can't be loaded in the same process.
+-  return true;
+-#else
+   if (PR_GetEnv("MOZ_DISABLE_OOP_PLUGINS")) {
+     return false;
+   }
+@@ -245,28 +240,6 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+     return false;
+   }
+ 
+-#ifdef ACCESSIBILITY
+-  // Certain assistive technologies don't want oop Flash, thus we have a special
+-  // pref for them to disable oop Flash (refer to bug 785047 for details).
+-  bool useA11yPref = false;
+-#ifdef XP_WIN
+-  useA11yPref =  a11y::Compatibility::IsJAWS();
+-#endif
+-#endif
+-
+-#ifdef XP_WIN
+-  // On Windows 7+, we force Flash to run in OOPP mode because Adobe
+-  // doesn't test Flash in-process and there are known stability bugs.
+-  if (aPluginTag->mIsFlashPlugin && IsWin7SP1OrLater()) {
+-#ifdef ACCESSIBILITY
+-    if (!useA11yPref)
+-      return true;
+-#else
+-    return true;
+-#endif
+-  }
+-#endif
+-
+   nsIPrefBranch* prefs = Preferences::GetRootBranch();
+   if (!prefs) {
+     return false;
+@@ -296,11 +269,6 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+   nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.");
+ #endif
+ 
+-#ifdef ACCESSIBILITY
+-  if (useA11yPref)
+-    prefGroupKey.AssignLiteral("dom.ipc.plugins.enabled.a11y.");
+-#endif
+-
+   uint32_t prefCount;
+   char** prefNames;
+   nsresult rv = prefs->GetChildList(prefGroupKey.get(),
+@@ -348,15 +316,11 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+     Preferences::GetBool("dom.ipc.plugins.enabled.ppc", false);
+ #endif
+ #else
+-#ifdef ACCESSIBILITY
+-    useA11yPref ? Preferences::GetBool("dom.ipc.plugins.enabled.a11y", false) :
+-#endif
+     Preferences::GetBool("dom.ipc.plugins.enabled", false);
+ #endif
+   }
+ 
+   return oopPluginsEnabled;
+-#endif
+ }
+ 
+ inline PluginLibrary*
+-- 
+2.43.7
+
+
+From c3c0d6f8c3fee396194e8fa5a89f7bc7c72e5493 Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Sat, 6 Dec 2025 20:20:55 +0800
+Subject: [PATCH 4/8] Issue #2875 - Cleanup: Remove leading whitespace in
+ nsPluginHost.cpp.
+
+---
+ dom/plugins/base/nsPluginHost.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dom/plugins/base/nsPluginHost.cpp b/dom/plugins/base/nsPluginHost.cpp
+index 49a52b4f7b..e65ad8ac47 100644
+--- a/dom/plugins/base/nsPluginHost.cpp
++++ b/dom/plugins/base/nsPluginHost.cpp
+@@ -1084,7 +1084,7 @@ nsPluginHost::GetBlocklistStateForType(const nsACString &aMimeType,
+   return tag->GetBlocklistState(aState);
+ }
+ 
+- NS_IMETHODIMP
++NS_IMETHODIMP
+ nsPluginHost::IsPluginOOP(const nsACString& aMimeType,
+                           bool* aResult)
+ {
+-- 
+2.43.7
+
+
+From af2315d5885073036bc16c285d9dd43618cf5446 Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Sun, 7 Dec 2025 20:24:06 +0800
+Subject: [PATCH 5/8] Issue #2861 - Remove Mac-specific ifdefs.
+
+macOS should now use the "dom.ipc.plugins.enabled" pref, like every other OS.
+---
+ dom/plugins/base/nsNPAPIPlugin.cpp | 24 +-----------------------
+ 1 file changed, 1 insertion(+), 23 deletions(-)
+
+diff --git a/dom/plugins/base/nsNPAPIPlugin.cpp b/dom/plugins/base/nsNPAPIPlugin.cpp
+index ad3c605b61..abf5caa136 100644
+--- a/dom/plugins/base/nsNPAPIPlugin.cpp
++++ b/dom/plugins/base/nsNPAPIPlugin.cpp
+@@ -257,18 +257,7 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+   prefFile.Cut(0, slashPos + 1);
+   ToLowerCase(prefFile);
+ 
+-#ifdef XP_MACOSX
+-#if defined(__i386__)
+-  nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.i386.");
+-#elif defined(__x86_64__)
+-  nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.x86_64.");
+-#elif defined(__ppc__)
+-  nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.ppc.");
+-#endif
+-#else
+   nsAutoCString prefGroupKey("dom.ipc.plugins.enabled.");
+-#endif
+-
+   uint32_t prefCount;
+   char** prefNames;
+   nsresult rv = prefs->GetChildList(prefGroupKey.get(),
+@@ -306,18 +295,7 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+   }
+ 
+   if (!prefSet) {
+-    oopPluginsEnabled =
+-#ifdef XP_MACOSX
+-#if defined(__i386__)
+-    Preferences::GetBool("dom.ipc.plugins.enabled.i386", false);
+-#elif defined(__x86_64__)
+-    Preferences::GetBool("dom.ipc.plugins.enabled.x86_64", false);
+-#elif defined(__ppc__)
+-    Preferences::GetBool("dom.ipc.plugins.enabled.ppc", false);
+-#endif
+-#else
+-    Preferences::GetBool("dom.ipc.plugins.enabled", false);
+-#endif
++    oopPluginsEnabled = Preferences::GetBool("dom.ipc.plugins.enabled", false);
+   }
+ 
+   return oopPluginsEnabled;
+-- 
+2.43.7
+
+
+From 0e3a84fc2d3c3bbed92e72e180541886f3dc6dcc Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Tue, 9 Dec 2025 10:52:59 +0800
+Subject: [PATCH 6/8] Issue #2875 - Ensure OOP for plugins by default even if
+ pref couldn't be found.
+
+---
+ dom/plugins/base/nsNPAPIPlugin.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/dom/plugins/base/nsNPAPIPlugin.cpp b/dom/plugins/base/nsNPAPIPlugin.cpp
+index abf5caa136..9cb206ac01 100644
+--- a/dom/plugins/base/nsNPAPIPlugin.cpp
++++ b/dom/plugins/base/nsNPAPIPlugin.cpp
+@@ -242,7 +242,7 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+ 
+   nsIPrefBranch* prefs = Preferences::GetRootBranch();
+   if (!prefs) {
+-    return false;
++    return true;
+   }
+ 
+   // Get per-library whitelist/blacklist pref string
+@@ -263,7 +263,7 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+   nsresult rv = prefs->GetChildList(prefGroupKey.get(),
+                                     &prefCount, &prefNames);
+ 
+-  bool oopPluginsEnabled = false;
++  bool oopPluginsEnabled = true;
+   bool prefSet = false;
+ 
+   if (NS_SUCCEEDED(rv) && prefCount > 0) {
+@@ -295,7 +295,7 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+   }
+ 
+   if (!prefSet) {
+-    oopPluginsEnabled = Preferences::GetBool("dom.ipc.plugins.enabled", false);
++    oopPluginsEnabled = Preferences::GetBool("dom.ipc.plugins.enabled", true);
+   }
+ 
+   return oopPluginsEnabled;
+-- 
+2.43.7
+
+
+From 37a95044bcbbc7bfbc261546ed37cd2f3fbee13c Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Tue, 9 Dec 2025 11:16:19 +0800
+Subject: [PATCH 7/8] Issue #2861 - Bring back forced OOPP for GTK3.
+
+Per discussion in PR #2875 our NPAPI implementation doesn't support plugins
+using GTK3 anyway so there's no point in keeping this footgun for a GTK3 setup.
+---
+ dom/plugins/base/nsNPAPIPlugin.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/dom/plugins/base/nsNPAPIPlugin.cpp b/dom/plugins/base/nsNPAPIPlugin.cpp
+index 9cb206ac01..746e271abc 100644
+--- a/dom/plugins/base/nsNPAPIPlugin.cpp
++++ b/dom/plugins/base/nsNPAPIPlugin.cpp
+@@ -245,6 +245,11 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+     return true;
+   }
+ 
++  // In GTK3+ this is always true because all plugins use GTK2 and both GTK
++  // libraries can't be loaded in the same process.
++  bool oopPluginsEnabled = true;
++
++#if !defined(MOZ_WIDGET_GTK) || (MOZ_WIDGET_GTK == 2)
+   // Get per-library whitelist/blacklist pref string
+   // "dom.ipc.plugins.enabled.filename.dll" and fall back to the default value
+   // of "dom.ipc.plugins.enabled"
+@@ -263,7 +268,6 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+   nsresult rv = prefs->GetChildList(prefGroupKey.get(),
+                                     &prefCount, &prefNames);
+ 
+-  bool oopPluginsEnabled = true;
+   bool prefSet = false;
+ 
+   if (NS_SUCCEEDED(rv) && prefCount > 0) {
+@@ -297,6 +301,7 @@ nsNPAPIPlugin::RunPluginOOP(const nsPluginTag *aPluginTag)
+   if (!prefSet) {
+     oopPluginsEnabled = Preferences::GetBool("dom.ipc.plugins.enabled", true);
+   }
++#endif /* !defined(MOZ_WIDGET_GTK) || (MOZ_WIDGET_GTK == 2) */
+ 
+   return oopPluginsEnabled;
+ }
+-- 
+2.43.7
+
+
+From 59ed319449a7b708062739fb00ae108e855dd74d Mon Sep 17 00:00:00 2001
+From: Job Bautista <jobbautista9@protonmail.com>
+Date: Wed, 10 Dec 2025 11:08:59 +0800
+Subject: [PATCH 8/8] Issue #2861 - Part 2 Follow-up: nsIPluginHost.isPluginOOP
+ should not always return true.
+
+Actually restore the method as it was when it was added in Mozilla bug 1178896.
+---
+ dom/plugins/base/nsPluginHost.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/dom/plugins/base/nsPluginHost.cpp b/dom/plugins/base/nsPluginHost.cpp
+index e65ad8ac47..11f54ab87f 100644
+--- a/dom/plugins/base/nsPluginHost.cpp
++++ b/dom/plugins/base/nsPluginHost.cpp
+@@ -1088,7 +1088,11 @@ NS_IMETHODIMP
+ nsPluginHost::IsPluginOOP(const nsACString& aMimeType,
+                           bool* aResult)
+ {
+-  *aResult = true;
++  nsPluginTag* tag = FindNativePluginForType(aMimeType, true);
++  if (!tag) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++  *aResult = nsNPAPIPlugin::RunPluginOOP(tag);
+   return NS_OK;
+ }
+ 
+-- 
+2.43.7
+
